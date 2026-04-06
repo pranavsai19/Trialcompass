@@ -218,3 +218,5 @@ data/*.ndjson
 # FAISS index artifacts
 data/*.index
 data/*.faiss
+data/*.bin
+data/*.npy
