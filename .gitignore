@@ -208,3 +208,13 @@ __marimo__/
 
 # Project brain — local only, never push
 CLAUDE.md
+
+# Data files — reproduced by running fetch_trials.py
+data/raw/
+data/processed/
+data/*.db
+data/*.ndjson
+
+# FAISS index artifacts
+data/*.index
+data/*.faiss
