@@ -1,0 +1,30 @@
+# Core ML
+torch
+sentence-transformers
+faiss-cpu
+transformers
+
+# LangChain / LangGraph
+langchain
+langchain-community
+langgraph
+
+# Data & Storage
+pandas
+requests
+sqlite-utils
+
+# Validation
+pydantic
+
+# UI
+streamlit
+
+# Evaluation
+scikit-learn
+numpy
+
+# Dev
+pytest
+python-dotenv
+jupyter
