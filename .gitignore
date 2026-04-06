@@ -208,3 +208,9 @@ __marimo__/
 
 # Project brain — local only, never push
 CLAUDE.md
+
+# Data files — too large for git, reproduced by running fetch_trials.py
+data/raw/
+data/processed/
+data/*.db
+data/*.ndjson
