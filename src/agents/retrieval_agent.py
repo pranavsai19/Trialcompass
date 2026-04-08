@@ -2,17 +2,22 @@
 Retrieval agent — FAISS bi-encoder retrieval + cross-encoder reranking.
 
 Two-stage pipeline:
-  1. Embed the patient query with all-MiniLM-L6-v2, pull top-50 from FAISS (cosine).
-  2. Score each (query, chunk_text) pair with ms-marco-MiniLM-L-12-v2, re-sort.
+  1. Embed the patient query with neuml/pubmedbert-base-embeddings, pull top-50
+     from the 64K-trial PubMedBERT FAISS index (cosine via IndexFlatIP).
+  2. Score each (query, chunk_text) pair with ClinicalReranker (ms-marco
+     MiniLM L-6-v2 cross-encoder), re-sort. Reranking is toggled by
+     use_reranker flag — set False to return raw FAISS order.
 
-Known limitation documented in notebooks/04_retrieval_eval.ipynb:
-the ms-marco cross-encoder degrades mean P@5 from 0.080 → 0.060 on our eval set.
-Domain mismatch — it was trained on web passages, not clinical eligibility text.
-We keep it in the pipeline because (a) it's the standard baseline to beat, and
-(b) swapping in a biomedical cross-encoder is the planned Component 5 upgrade.
+Embedding model upgrade (2026-04-08): switched from all-MiniLM-L6-v2 (10K index)
+to neuml/pubmedbert-base-embeddings (64K index). Manual relevance audit confirmed
+top-10 retrievals are clinically coherent for 4 of 5 audited queries.
+
+Known limitation: ms-marco cross-encoder was trained on web passage retrieval,
+not clinical eligibility text. It is the documented baseline to beat — a
+biomedical cross-encoder fine-tuned on clinical trial text is the planned upgrade.
 
 The FAISS index and embedding model are loaded at module import time.
-SQLite is opened per-call — cheap enough at 10K rows, avoids holding a connection.
+SQLite is opened per-call — cheap enough, avoids holding a connection.
 """
 
 import os
@@ -23,18 +28,19 @@ from typing import Any, Optional
 
 import faiss
 import numpy as np
-from sentence_transformers import CrossEncoder, SentenceTransformer
+from sentence_transformers import SentenceTransformer
+
+from src.retrieval.reranker import ClinicalReranker
 
 # ---------------------------------------------------------------------------
 # Paths — DB_PATH overridable via environment so tests can point at a fixture DB
 # ---------------------------------------------------------------------------
 
-_INDEX_PATH = Path("data/faiss_index.bin")
-_NCTIDS_PATH = Path("data/nct_ids.npy")
+_INDEX_PATH  = Path("data/trials_pubmedbert.index")
+_NCTIDS_PATH = Path("data/nct_ids_pubmedbert.npy")
 DB_PATH = Path(os.environ.get("DB_PATH", "data/trialcompass.db"))
 
-_BI_MODEL_NAME = "all-MiniLM-L6-v2"
-_CE_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-12-v2"
+_BI_MODEL_NAME = "neuml/pubmedbert-base-embeddings"
 
 # ---------------------------------------------------------------------------
 # Module-level model / index load — pay the cost once, not per call
@@ -43,13 +49,13 @@ _CE_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-12-v2"
 if not _INDEX_PATH.exists():
     raise FileNotFoundError(
         f"FAISS index not found at {_INDEX_PATH}. "
-        "Run the embedding pipeline first: python -m src.embeddings.faiss_index"
+        "Run: python src/embeddings/embed_biobert.py to build the PubMedBERT index."
     )
 
 _index: faiss.IndexFlatIP = faiss.read_index(str(_INDEX_PATH))
 _nct_ids: np.ndarray = np.load(str(_NCTIDS_PATH), allow_pickle=True)
 _bi_encoder: SentenceTransformer = SentenceTransformer(_BI_MODEL_NAME)
-_cross_encoder: CrossEncoder = CrossEncoder(_CE_MODEL_NAME)
+_reranker: ClinicalReranker = ClinicalReranker()
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +129,7 @@ def retrieve_and_rerank(
     patient_profile: dict[str, Any],
     top_k: int = 10,
     faiss_candidates: int = 50,
+    use_reranker: bool = True,
 ) -> list[dict[str, Any]]:
     """
     Full two-stage retrieval for a patient profile.
@@ -137,14 +144,18 @@ def retrieve_and_rerank(
         How many results to return after reranking. Default 10.
     faiss_candidates : int
         How many candidates to pull from FAISS before cross-encoder reranking.
-        50 is enough at 10K trials — increase for larger corpora.
+        50 is the recommended value for 64K-trial corpus.
+    use_reranker : bool
+        If True (default), run ClinicalReranker cross-encoder on top-50 candidates
+        and sort by ce_score. If False, return the raw FAISS bi-encoder order
+        (useful for ablation comparisons and latency-sensitive contexts).
 
     Returns
     -------
     list[dict]
         Ranked list of trials, best match first. Each dict has:
         nct_id, brief_title, conditions, eligibility_text, chunk_text,
-        bi_encoder_score, cross_encoder_score, rank (1-indexed).
+        bi_encoder_score, ce_score (if use_reranker), rank (1-indexed).
     """
     query = build_query_string(patient_profile)
     print(f"[retrieval] query: {query!r}")
@@ -166,7 +177,7 @@ def retrieve_and_rerank(
         for rank, i in enumerate(bi_indices[0])
     ]
 
-    # --- Fetch chunk_text from SQLite for cross-encoder ---
+    # --- Fetch chunk_text from SQLite ---
     con = sqlite3.connect(str(DB_PATH))
     con.row_factory = sqlite3.Row
     cur = con.cursor()
@@ -181,23 +192,31 @@ def retrieve_and_rerank(
     rows = {r["nct_id"]: dict(r) for r in cur.fetchall()}
     con.close()
 
-    # Preserve FAISS order for the cross-encoder input
-    ordered_rows = [rows[nct] for nct, _ in candidates if nct in rows]
+    # Preserve FAISS order; attach bi_encoder_score
+    ordered_rows = []
     bi_score_map = {nct: score for nct, score in candidates}
+    for nct, _ in candidates:
+        if nct in rows:
+            row = rows[nct]
+            row["bi_encoder_score"] = bi_score_map[nct]
+            ordered_rows.append(row)
 
-    # --- Stage 2: cross-encoder reranking ---
-    t1 = time.time()
-    pairs = [(query, r["chunk_text"] or "") for r in ordered_rows]
-    ce_scores = _cross_encoder.predict(pairs)
-    ce_elapsed = time.time() - t1
-    print(f"[retrieval] cross-encoder scored {len(pairs)} pairs in {ce_elapsed:.3f}s")
-
-    # Attach scores and sort
-    for row, ce_score in zip(ordered_rows, ce_scores):
-        row["bi_encoder_score"] = bi_score_map.get(row["nct_id"], 0.0)
-        row["cross_encoder_score"] = float(ce_score)
-
-    reranked = sorted(ordered_rows, key=lambda r: r["cross_encoder_score"], reverse=True)
+    # --- Stage 2: cross-encoder reranking (optional) ---
+    if use_reranker:
+        t1 = time.time()
+        reranked = _reranker.rerank(query, ordered_rows)
+        ce_elapsed = time.time() - t1
+        print(
+            f"[retrieval] cross-encoder reranked {len(ordered_rows)} candidates "
+            f"in {ce_elapsed:.3f}s"
+        )
+        print(
+            f"[retrieval] top-3 ce_scores: "
+            + ", ".join(f"{r['ce_score']:.3f}" for r in reranked[:3])
+        )
+    else:
+        reranked = ordered_rows
+        print("[retrieval] reranker disabled — returning raw FAISS order")
 
     # Add 1-indexed rank and trim to top_k
     for i, row in enumerate(reranked[:top_k]):
