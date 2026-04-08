@@ -47,16 +47,15 @@ The four nodes are wired as a linear LangGraph state machine. Errors propagate t
 
 ## Evaluation
 
-Embedding model: `neuml/pubmedbert-base-embeddings`. Corpus: 64,920 oncology trials from ClinicalTrials.gov. Eval set: 10-query oncology benchmark with 17 labeled NCT IDs, all manually verified against actual ClinicalTrials.gov eligibility criteria text before use as labels.
+Embedding model: `neuml/pubmedbert-base-embeddings`. Corpus: 64,920 oncology trials from ClinicalTrials.gov. Eval set: 10-query oncology benchmark with 14 labeled NCT IDs, all manually verified against actual ClinicalTrials.gov eligibility criteria text before use as labels. Eval script: `src/evaluation/eval_three_configs.py`.
 
-| Model | P@5 | MRR | Notes |
-|---|---|---|---|
-| MiniLM (all-MiniLM-L6-v2, 10K corpus) | 0.080 | 0.150 | Original baseline |
-| BioBERT raw (64K corpus) | 0.000 | 0.002 | MLM pretraining ≠ retrieval objective |
-| PubMedBERT bi-encoder (64K corpus) | 0.000 | 0.009 | See note below |
-| PubMedBERT + MS-MARCO cross-encoder rerank | 0.020 | 0.056 | Domain mismatch on clinical text documented |
+| Configuration | P@5 | MRR | k | Notes |
+|---|---|---|---|---|
+| A: PubMedBERT bi-encoder only | 0.000 | 0.000 | 50 | Baseline |
+| B: + MS-MARCO cross-encoder rerank | 0.020 | 0.039 | 50 | CE signal degrades at k>100 on full corpus |
+| C: Hybrid (structured filter + CE rerank) | 0.040 | 0.084 | 500 | Filter reduces corpus to ~6,900; k=500 on filtered pool = k=50 density on full corpus |
 
-The P@5=0.000 for PubMedBERT bi-encoder alone reflects a known limitation of exact-match evaluation in large-corpus IR: with 60K+ oncology trials, a bi-encoder retrieves hundreds of clinically valid candidates per query, and P@5 against 1–2 specific NCT IDs approaches zero by construction. Manual relevance audit of 5 queries confirmed that top-10 retrievals are clinically coherent for 4 of 5 queries — the model correctly scopes the search space. This is the documented motivation for cross-encoder re-ranking (Component 4), which makes the fine-grained pairwise distinctions the bi-encoder cannot. Manual audit of cross-encoder reranking on 5 queries showed genuine improvement on HER2+ breast cancer retrieval (Q02), lateral reshuffling on CRC and prostate queries, and no improvement on HCC where Child-Pugh score is a structured field not resolvable from eligibility prose — a documented limitation motivating hybrid structured+semantic retrieval.
+The structured pre-filter is not a speed optimization — it is a quality gate. At k=500 on the full 64,920-trial corpus, cross-encoder scores compress toward a narrow band and performance degrades (Config B P@5 drops to 0.000). At k=500 on the filtered ~6,900-trial sub-corpus, pool density is equivalent to k=50 on the full corpus, and the cross-encoder maintains discriminative signal. This interaction between corpus size, retrieval depth, and reranker quality is the central empirical finding of this project.
 
 ---
 
