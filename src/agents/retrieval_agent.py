@@ -1,23 +1,20 @@
 """
-Retrieval agent — FAISS bi-encoder retrieval + cross-encoder reranking.
+Retrieval agent — hybrid structured pre-filter + FAISS bi-encoder + cross-encoder rerank.
 
-Two-stage pipeline:
-  1. Embed the patient query with neuml/pubmedbert-base-embeddings, pull top-50
-     from the 64K-trial PubMedBERT FAISS index (cosine via IndexFlatIP).
-  2. Score each (query, chunk_text) pair with ClinicalReranker (ms-marco
-     MiniLM L-6-v2 cross-encoder), re-sort. Reranking is toggled by
-     use_reranker flag — set False to return raw FAISS order.
+Three-stage pipeline:
+  1. Structured pre-filter: apply hard constraints (age, status, phase, condition
+     keywords) via StructuredFilter to narrow 64K corpus to a manageable candidate
+     set. Resolves structured clinical fields that semantic search cannot distinguish
+     (e.g. Child-Pugh score, ECOG, age limits). Falls back to full corpus if filter
+     returns < MIN_FILTER_SIZE candidates.
+  2. Bi-encoder FAISS retrieval: embed query with neuml/pubmedbert-base-embeddings,
+     search within the filtered sub-index (top-50).
+  3. Cross-encoder reranking: ClinicalReranker (ms-marco MiniLM L-6-v2) scores
+     each (query, chunk_text) pair and re-sorts. Toggled by use_reranker flag.
 
-Embedding model upgrade (2026-04-08): switched from all-MiniLM-L6-v2 (10K index)
-to neuml/pubmedbert-base-embeddings (64K index). Manual relevance audit confirmed
-top-10 retrievals are clinically coherent for 4 of 5 audited queries.
-
-Known limitation: ms-marco cross-encoder was trained on web passage retrieval,
-not clinical eligibility text. It is the documented baseline to beat — a
-biomedical cross-encoder fine-tuned on clinical trial text is the planned upgrade.
-
-The FAISS index and embedding model are loaded at module import time.
-SQLite is opened per-call — cheap enough, avoids holding a connection.
+Embedding model: neuml/pubmedbert-base-embeddings (64K index).
+Manual relevance audit: top-10 retrievals clinically coherent for 4 of 5 queries.
+Known limitation: ms-marco cross-encoder trained on web passages, not clinical text.
 """
 
 import os
@@ -31,6 +28,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from src.retrieval.reranker import ClinicalReranker
+from src.retrieval.structured_filter import StructuredFilter
 
 # ---------------------------------------------------------------------------
 # Paths — DB_PATH overridable via environment so tests can point at a fixture DB
@@ -56,6 +54,10 @@ _index: faiss.IndexFlatIP = faiss.read_index(str(_INDEX_PATH))
 _nct_ids: np.ndarray = np.load(str(_NCTIDS_PATH), allow_pickle=True)
 _bi_encoder: SentenceTransformer = SentenceTransformer(_BI_MODEL_NAME)
 _reranker: ClinicalReranker = ClinicalReranker()
+_struct_filter: StructuredFilter = StructuredFilter(DB_PATH)
+
+# Minimum filtered corpus size — fall back to full index below this threshold
+MIN_FILTER_SIZE = 100
 
 
 # ---------------------------------------------------------------------------
@@ -130,25 +132,29 @@ def retrieve_and_rerank(
     top_k: int = 10,
     faiss_candidates: int = 50,
     use_reranker: bool = True,
+    use_structured_filter: bool = True,
 ) -> list[dict[str, Any]]:
     """
-    Full two-stage retrieval for a patient profile.
+    Full three-stage retrieval for a patient profile.
 
     Parameters
     ----------
     patient_profile : dict
         Structured output from parser_agent.parse_patient_profile(), or any dict
-        with the same keys: cancer_type, biomarkers, ecog, prior_treatment_lines,
-        age, metastatic.
+        with keys: cancer_type, biomarkers, ecog, prior_treatment_lines, age,
+        metastatic, phase (list), status (list).
     top_k : int
         How many results to return after reranking. Default 10.
     faiss_candidates : int
         How many candidates to pull from FAISS before cross-encoder reranking.
-        50 is the recommended value for 64K-trial corpus.
+        50 is the recommended value for the 64K-trial corpus.
     use_reranker : bool
         If True (default), run ClinicalReranker cross-encoder on top-50 candidates
-        and sort by ce_score. If False, return the raw FAISS bi-encoder order
-        (useful for ablation comparisons and latency-sensitive contexts).
+        and sort by ce_score. If False, return the raw FAISS bi-encoder order.
+    use_structured_filter : bool
+        If True (default), apply StructuredFilter pre-filter to narrow the corpus
+        before FAISS search. Falls back to full corpus if filter is too restrictive
+        (< MIN_FILTER_SIZE results). Set False to bypass for ablation testing.
 
     Returns
     -------
@@ -160,20 +166,67 @@ def retrieve_and_rerank(
     query = build_query_string(patient_profile)
     print(f"[retrieval] query: {query!r}")
 
-    # --- Stage 1: bi-encoder FAISS retrieval ---
+    # --- Stage 1: Structured pre-filter ---
+    search_index = _index        # default: full 64K index
+    search_nct_ids = _nct_ids
+
+    if use_structured_filter:
+        t_sf = time.time()
+        age    = patient_profile.get("age")
+        phase  = patient_profile.get("phase")       # list[str] or None
+        status = patient_profile.get("status")      # list[str] or None
+        # Derive condition keywords from cancer_type if not explicitly provided
+        cond_kw = patient_profile.get("conditions_keywords")
+        if cond_kw is None:
+            cancer_type = patient_profile.get("cancer_type", "")
+            if cancer_type:
+                cond_kw = [cancer_type] + ["cancer", "carcinoma", "tumor", "neoplasm"]
+
+        filtered_ncts = _struct_filter.filter(
+            age=age,
+            phase=phase,
+            status=status,
+            conditions_keywords=cond_kw,
+        )
+        sf_elapsed = time.time() - t_sf
+
+        if len(filtered_ncts) >= MIN_FILTER_SIZE:
+            positions = _struct_filter.filter_to_index_positions(filtered_ncts, _nct_ids)
+            # Build a sub-index from the filtered positions' vectors
+            sub_vecs = np.vstack([_index.reconstruct(int(p)) for p in positions]).astype("float32")
+            sub_index = faiss.IndexFlatIP(sub_vecs.shape[1])
+            sub_index.add(sub_vecs)
+            sub_nct_ids = np.array([_nct_ids[p] for p in positions])
+            search_index   = sub_index
+            search_nct_ids = sub_nct_ids
+            print(
+                f"[retrieval] structured filter: {len(_nct_ids):,} → {len(filtered_ncts):,} "
+                f"trials in {sf_elapsed:.3f}s"
+            )
+        else:
+            print(
+                f"[retrieval] structured filter returned {len(filtered_ncts)} candidates "
+                f"(< {MIN_FILTER_SIZE} threshold) — falling back to full corpus"
+            )
+
+    # --- Stage 2: bi-encoder FAISS retrieval ---
+    actual_candidates = min(faiss_candidates, len(search_nct_ids))
     t0 = time.time()
     q_emb = _bi_encoder.encode(
         [query],
         convert_to_numpy=True,
-        normalize_embeddings=True,  # cosine via inner product on unit vectors
+        normalize_embeddings=True,
     ).astype("float32")
-    bi_scores, bi_indices = _index.search(q_emb, faiss_candidates)
+    bi_scores, bi_indices = search_index.search(q_emb, actual_candidates)
     bi_elapsed = time.time() - t0
-    print(f"[retrieval] FAISS top-{faiss_candidates} retrieved in {bi_elapsed:.3f}s")
+    print(
+        f"[retrieval] FAISS top-{actual_candidates} retrieved in {bi_elapsed:.3f}s "
+        f"(searched {len(search_nct_ids):,} vectors)"
+    )
 
-    # Map index positions → (nct_id, bi_score)
+    # Map sub-index positions → (nct_id, bi_score)
     candidates = [
-        (_nct_ids[i], float(bi_scores[0][rank]))
+        (str(search_nct_ids[i]), float(bi_scores[0][rank]))
         for rank, i in enumerate(bi_indices[0])
     ]
 
