@@ -1,66 +1,86 @@
 # TrialCompass
 
-I kept wondering why oncologists still manually scan through thousands of trials to find one match for a patient.
+**Agentic clinical trial matching for oncology patients**
 
-The problem is not access — ClinicalTrials.gov has over 400,000 registered studies, all publicly available. The problem is signal. A patient with triple-negative breast cancer, BRCA2 mutation, two prior chemo lines, and an ECOG score of 1 needs a very different trial than a patient with the same diagnosis and no prior treatment. Keyword search does not capture that. It returns noise. Clinicians either over-rely on what they already know, or spend hours they do not have reading eligibility criteria one by one.
-
-TrialCompass is my attempt to build something better — an agentic AI system that takes a structured patient profile and returns a ranked, explainable list of matching oncology trials from ClinicalTrials.gov.
-
----
-
-## What the System Does
-
-TrialCompass is not a search engine. It is a multi-agent pipeline built on LangGraph where each agent owns a distinct piece of the reasoning problem:
-
-1. **Patient Profile Parser** — Takes free-text or structured patient input and extracts structured fields: primary cancer type (ICD-10 code), biomarker status (BRCA1/2, PD-L1, KRAS, HER2), ECOG performance status, prior treatment lines, age, metastasis status. Runs locally via Ollama using Llama 3 8B or BioMistral-7B. Output is validated with Pydantic so nothing downstream breaks on a missing field.
-
-2. **Retrieval Agent** — Queries a FAISS index of 60,000+ oncology trial documents embedded with a biomedical sentence encoder. Pulls the top-50 candidates by semantic similarity. This is fast and broad — precision is not the goal here, recall is.
-
-3. **Re-Ranking Agent** — Runs a cross-encoder (ms-marco-MiniLM-L12-v2) over the top-50 to re-score based on actual query-document relevance. This is where the quality jump happens. The delta between bi-encoder retrieval and retrieve-then-rerank is one of the things I am measuring.
-
-4. **Explanation Agent** — Takes the top-10 reranked trials and reasons through eligibility criteria for this specific patient. Uses chain-of-thought prompting to flag inclusion matches, exclusion violations, and uncertain criteria. Applies SELF-RAG-style confidence scoring — if the LLM is not sure, it says so rather than fabricating a match. Every claim is tagged with the source chunk that drove it.
-
-5. **Orchestration** — LangGraph manages the state machine: parse → retrieve → rerank → explain → return. Each agent can be swapped or extended without touching the others.
+![Python 3.11](https://img.shields.io/badge/python-3.11-blue)
+![License](https://img.shields.io/badge/license-Apache%202.0-green)
+![pytest](https://img.shields.io/badge/pytest-passing-brightgreen)
 
 ---
 
-## The Five Components
+## Overview
 
-| Component | What It Does | Key Tech |
-|-----------|-------------|----------|
-| Data Ingestion | Pull + preprocess 60K+ oncology trials from ClinicalTrials.gov API v2 | `requests`, `pandas`, `sqlite-utils` |
-| Vector Store | Embed trials, build FAISS index, benchmark retrieval | `sentence-transformers`, `faiss-cpu` |
-| Parser Agent | Extract structured patient profile from input | Ollama, Pydantic, LangChain |
-| Retrieval + Reranking | FAISS top-50 → cross-encoder rerank → top-10 | `sentence-transformers` cross-encoders |
-| Explanation Agent | CoT reasoning over eligibility criteria, confidence scoring, provenance | LangGraph, BioMistral-7B |
+TrialCompass takes a free-text patient description — cancer type, biomarkers, prior treatments, performance status — and returns a ranked, explained list of matching clinical trials from a 10,000-trial ClinicalTrials.gov corpus. Keyword search fails for this problem because eligibility criteria are written in clinical shorthand: "EGFR exon 19 deletion, treatment-naive, ECOG ≤1" does not surface from a query like "lung cancer trial." The agentic approach solves this by decomposing the task — a parser agent structures the free text into a validated schema, a retrieval agent does semantic search and cross-encoder reranking over FAISS-indexed trial documents, and an explanation agent runs chain-of-thought eligibility reasoning per trial with SELF-RAG confidence flags and provenance citations. The result is a pipeline that produces ranked verdicts with reasoning, not a bag of keyword hits.
 
 ---
 
-## Evaluation
+## Architecture
 
-The metrics that matter here:
+```
+Patient Profile (free text)
+        │
+        ▼
+┌─────────────────┐
+│   Parse Node    │  llama3 via Ollama — extracts cancer type, biomarkers,
+│                 │  ECOG, prior treatments, age, metastatic status
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Retrieve Node  │  all-MiniLM-L6-v2 → FAISS top-50 → ms-marco cross-encoder rerank
+│                 │  10,000 oncology trials from ClinicalTrials.gov
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Explain Node   │  Chain-of-thought reasoning per trial
+│                 │  SELF-RAG confidence flags, provenance tagging
+└────────┬────────┘
+         │
+         ▼
+Ranked matches with verdicts, reasoning, and human-review flags
+```
 
-- **Precision@5** — Of the top 5 returned trials, how many are actually eligible for this patient?
-- **MRR (Mean Reciprocal Rank)** — How far down the list do you have to go to find the first correct match?
-- **Hallucination Rate** — When the explanation agent makes a claim about eligibility, what fraction of those claims are unsupported by the source documents?
-
-Baseline is bi-encoder retrieval only. The goal is to show that LangGraph orchestration with reranking and structured reasoning produces a measurable lift on all three.
+The four nodes are wired as a linear LangGraph state machine. Errors propagate through a state field — no conditional edges, no silent swallowing. Each node is a thin wrapper around its agent module so the graph stays decoupled from inference logic.
 
 ---
 
-## Tech Stack
+## Evaluation Results
 
-- **Orchestration**: LangGraph, LangChain
-- **LLMs**: BioMistral-7B or Llama 3 8B via Ollama (local, Mac MPS backend)
-- **Embeddings**: `all-MiniLM-L6-v2` → BioBERT / BioLinkBERT
-- **Vector Store**: FAISS (flat L2 index)
-- **Re-ranking**: `cross-encoder/ms-marco-MiniLM-L12-v2`
-- **Data**: ClinicalTrials.gov API v2 (public, no key required)
-- **Storage**: SQLite
-- **Validation**: Pydantic
-- **UI**: Streamlit
-- **Evaluation**: scikit-learn, numpy
-- **Language**: Python 3.11
+Measured on a 10-query oncology eval set with manually labeled relevant trials.
+
+| Metric | Bi-encoder only | + Cross-encoder rerank |
+|---|---|---|
+| Mean P@5 | 0.080 | 0.060 |
+| Mean MRR | 0.320 | 0.305 |
+| Hallucination rate | — | 0.40 |
+
+The cross-encoder regression is a domain mismatch: ms-marco-MiniLM-L-12-v2 was trained on web passage retrieval, not clinical eligibility text, and it actively hurts ranking quality on biomarker-specific queries. The 40% hallucination rate traces to two root causes: eligibility text is truncated at 2,000 characters before being passed to the LLM, so disqualifying criteria buried deeper in the document are never seen; and llama3 regularly misses implicit disease-subtype exclusions that a clinician would infer from context. Both are documented findings with clear remediation paths, not surprises.
+
+---
+
+## Quick Start
+
+```bash
+git clone git@github.com:pranavsai19/Trialcompass.git
+cd Trialcompass
+
+python3.11 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Pull the local LLM (requires Ollama installed and running)
+ollama pull llama3
+
+# Run the CLI pipeline
+PYTHONPATH=. python src/orchestration/run_pipeline.py \
+  --patient "58-year-old female, stage IV NSCLC, EGFR exon 19 deletion, ECOG 1, failed carboplatin+pemetrexed, metastatic"
+
+# Launch the Streamlit UI
+PYTHONPATH=. streamlit run app/streamlit_app.py
+```
+
+Ollama must be running (`ollama serve`) before any inference call. The FAISS index and SQLite database are in `data/` — no rebuild step needed for the 10K-trial corpus.
 
 ---
 
@@ -68,84 +88,49 @@ Baseline is bi-encoder retrieval only. The goal is to show that LangGraph orches
 
 ```
 trialcompass/
-├── CLAUDE.md                        # Engineering context and project spec
-├── README.md
-├── requirements.txt
-├── .env.example
+├── app/
+│   └── streamlit_app.py          # Streamlit UI — full pipeline demo
 ├── data/
-│   ├── raw/                         # Raw JSON from ClinicalTrials.gov API
-│   ├── processed/                   # Cleaned, flat text chunks
-│   └── trialcompass.db              # SQLite store
+│   ├── faiss_index.bin           # FAISS flat IP index, 10K trials
+│   ├── nct_ids.npy               # NCT ID array aligned to FAISS index
+│   └── trialcompass.db           # SQLite — trials table with chunk_text, eligibility_text
 ├── notebooks/
-│   ├── 01_data_exploration.ipynb    # API structure, field coverage analysis
-│   ├── 02_embedding_experiments.ipynb  # MiniLM vs BioBERT comparison
-│   ├── 03_parser_agent_dev.ipynb    # Prompt engineering for patient parser
-│   ├── 04_retrieval_eval.ipynb      # Precision@5, MRR benchmarks
-│   └── 05_explanation_agent_dev.ipynb  # CoT + SELF-RAG experiments
+│   ├── 01_data_exploration.ipynb
+│   ├── 02_embedding_experiments.ipynb
+│   ├── 03_parser_agent_dev.ipynb
+│   ├── 04_retrieval_eval.ipynb
+│   └── 05_explanation_agent_dev.ipynb
 ├── src/
-│   ├── ingestion/
-│   │   ├── fetch_trials.py          # ClinicalTrials.gov API client
-│   │   └── preprocess.py            # JSON → flat text chunks
-│   ├── embeddings/
-│   │   ├── embed.py                 # Embedding pipeline
-│   │   └── faiss_index.py           # Build, save, load FAISS index
 │   ├── agents/
-│   │   ├── parser_agent.py          # Patient profile extraction
-│   │   ├── retrieval_agent.py       # FAISS + cross-encoder reranking
-│   │   └── explanation_agent.py     # CoT eligibility reasoning
+│   │   ├── parser_agent.py       # Ollama/llama3 + Pydantic schema extraction
+│   │   ├── retrieval_agent.py    # FAISS bi-encoder + cross-encoder reranker
+│   │   └── explanation_agent.py  # CoT eligibility reasoning, SELF-RAG flags, provenance
+│   ├── embeddings/
+│   │   ├── embed.py              # Batch embedding with all-MiniLM-L6-v2
+│   │   └── faiss_index.py        # Index build and persistence
+│   ├── ingestion/
+│   │   ├── fetch_trials.py       # ClinicalTrials.gov API v2 pull
+│   │   └── preprocess.py         # JSON → flat text chunks → SQLite
 │   ├── orchestration/
-│   │   └── graph.py                 # LangGraph state machine
+│   │   ├── graph.py              # LangGraph state machine (4 nodes, linear)
+│   │   └── run_pipeline.py       # CLI wrapper with tabulate output
 │   └── evaluation/
-│       └── metrics.py               # Precision@K, MRR, hallucination rate
-├── tests/
-└── app/
-    └── streamlit_app.py             # Demo UI
+│       └── metrics.py            # Precision@K, MRR, hallucination rate
+└── tests/                        # pytest — parser, retrieval, explanation agents
 ```
 
 ---
 
-## How to Run Locally
+## Known Limitations
 
-**Prerequisites**: Python 3.11, Ollama installed and running (`ollama serve`), Llama 3 8B pulled (`ollama pull llama3`).
-
-```bash
-# Clone and set up
-git clone https://github.com/pranavsai19/trialcompass.git
-cd trialcompass
-python3.11 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-# Copy env template
-cp .env.example .env
-
-# Pull trial data (starts with 10K, scales to 60K+)
-python src/ingestion/fetch_trials.py
-
-# Build FAISS index
-python src/embeddings/faiss_index.py
-
-# Run evaluation
-python src/evaluation/metrics.py
-
-# Launch Streamlit UI
-streamlit run app/streamlit_app.py
-```
+- **Eligibility text truncation at 2,000 characters.** The LLM only sees the first ~500 tokens of each trial's eligibility criteria. Disqualifying criteria buried in the second half of the document are invisible to the explanation agent. This is the primary driver of the 40% hallucination rate.
+- **ms-marco cross-encoder domain mismatch.** The cross-encoder was trained on web retrieval pairs, not clinical text. It degrades P@5 from 0.080 to 0.060 on this eval set. A biomedical cross-encoder fine-tuned on clinical trial text is the planned replacement.
+- **llama3 confidence is not calibrated.** The model reports HIGH confidence on approximately every verdict, including wrong ones. The SELF-RAG human-review flag is driven by uncertainty phrases in the reasoning text and eligibility text length — the confidence field itself should be ignored.
 
 ---
 
-## What Comes Next
+## Citation
 
-A few things I want to tackle that are not in the current scope:
+If you use this work, please cite as:
 
-**Upgrade the embedding model.** `all-MiniLM-L6-v2` is fast but not trained on biomedical text. BioBERT or BioLinkBERT should give a meaningful retrieval quality improvement on biomarker-specific queries. I want to measure that delta explicitly before claiming it is worth the latency tradeoff.
-
-**Scale to the full ClinicalTrials.gov corpus.** 60K oncology trials is the target. Getting there requires batched API calls, incremental SQLite inserts, and a more careful chunking strategy — eligibility criteria sections alone can be 2,000+ tokens.
-
-**HPC scaling path.** The embedding pipeline and cross-encoder reranking are both parallelizable. On a single Mac the index build takes hours. On an HPC cluster with GPU nodes it should take minutes. This is the piece I want to explore at DL4Sci 2026 — how the architecture scales when you are not resource-constrained.
-
-**Better hallucination detection.** The current SELF-RAG approach is a first pass. A more rigorous approach would use NLI (natural language inference) to verify each LLM claim against the source document it cited. That is a cleaner signal than asking the model to rate its own confidence.
-
----
-
-*Built by Pranav Vishnuvajjhula — Data Scientist, UTD MSBA. Applying to DL4Sci 2026 at Lawrence Berkeley National Laboratory.*
+> Vishnuvajjhula, P. (2026). TrialCompass: Agentic RAG for Oncology Clinical Trial Matching.
