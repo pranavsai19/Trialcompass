@@ -49,7 +49,7 @@ def search(
     query: str,
     index: faiss.IndexFlatIP,
     nct_ids: np.ndarray,
-    model_name: str = "all-MiniLM-L6-v2",
+    model_name: str = "BAAI/bge-large-en-v1.5",
     top_k: int = 50,
 ) -> list[tuple[str, float]]:
     """

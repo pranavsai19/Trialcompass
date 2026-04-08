@@ -293,9 +293,9 @@ def explain_matches(
             patient_summary=patient_summary,
             trial_title=title[:100],
             nct_id=nct_id,
-            # 2000 chars is ~500 tokens — fits comfortably in llama3's 8K context alongside
-            # the prompt. Beyond 2000 the model starts losing early criteria (tested in notebook).
-            eligibility_text=elig[:2000],
+            # 4000 chars is ~1000 tokens — fits in llama3's 8K context with room for prompt overhead.
+            # Increased from 2000 to capture exclusion criteria in longer trials.
+            eligibility_text=elig[:4000],
         )
         raw = _call_ollama(prompt)
         elapsed = time.time() - t0
@@ -330,7 +330,7 @@ def explain_matches(
             prov_prompt = _PROVENANCE_PROMPT.format(
                 nct_id=nct_id,
                 inclusion_met=json.dumps(inclusion_met, indent=2),
-                eligibility_text=elig[:2000],
+                eligibility_text=elig[:4000],
             )
             t1 = time.time()
             prov_raw = _call_ollama(prov_prompt, timeout=45)

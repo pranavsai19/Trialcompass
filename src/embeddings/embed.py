@@ -2,9 +2,8 @@
 Embed trial chunk_text fields from SQLite using sentence-transformers.
 
 Truncation note (documented in notebooks/02_embedding_experiments.ipynb):
-all-MiniLM-L6-v2 max seq length = 256 tokens. 89% of trial chunks exceed
-~1000 chars. The bi-encoder sees title + phase + conditions + first ~100 words
-of eligibility. This is the primary motivation for cross-encoder reranking.
+BAAI/bge-large-en-v1.5 max seq length = 512 tokens. Upgraded from all-MiniLM-L6-v2
+(256 tokens) to capture biomarker terms buried deeper in eligibility text.
 """
 
 import logging
@@ -16,7 +15,7 @@ import sqlite_utils
 from sentence_transformers import SentenceTransformer
 
 DB_PATH = Path("data/trialcompass.db")
-DEFAULT_MODEL = "all-MiniLM-L6-v2"
+DEFAULT_MODEL = "BAAI/bge-large-en-v1.5"
 BATCH_SIZE = 128
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
