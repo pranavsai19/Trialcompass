@@ -3,6 +3,7 @@ torch
 sentence-transformers
 faiss-cpu
 transformers
+peft
 
 # LangChain / LangGraph
 langchain

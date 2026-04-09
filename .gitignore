@@ -220,3 +220,8 @@ data/*.index
 data/*.faiss
 data/*.bin
 data/*.npy
+
+# Model weights — too large for git; only allow JSON metadata
+models/
+!models/.gitkeep
+!models/**/*.json
