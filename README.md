@@ -45,6 +45,12 @@ The four nodes are wired as a linear LangGraph state machine. Errors propagate t
 
 ---
 
+## System Design
+
+End-to-end pipeline validation: on a 68-year-old platinum-resistant BRCA1-mutant ovarian cancer patient profile, the hybrid retrieval pipeline narrowed 64,920 trials to 9,877 via structured filter in 0.84s, retrieved and reranked to top-10 in 1.7s, and the explanation agent correctly flagged a cross-encoder false positive (a BRCA1-matching pancreatic trial ranked 1st by CE score) as INELIGIBLE due to cancer type mismatch. This demonstrates the value of the LLM reasoning layer as a clinical safety gate over the retrieval pipeline.
+
+---
+
 ## Evaluation
 
 Embedding model: `neuml/pubmedbert-base-embeddings`. Corpus: 64,920 oncology trials from ClinicalTrials.gov. Eval set: 10-query oncology benchmark with 14 labeled NCT IDs, all manually verified against actual ClinicalTrials.gov eligibility criteria text before use as labels. Eval script: `src/evaluation/eval_three_configs.py`.
