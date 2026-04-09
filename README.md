@@ -10,6 +10,20 @@
 
 ---
 
+## Demo
+
+![TrialCompass Architecture](docs/architecture.png)
+
+```bash
+# Terminal 1
+ollama serve
+
+# Terminal 2
+streamlit run app/streamlit_app.py
+```
+
+---
+
 ## Overview
 
 TrialCompass takes a free-text patient description — cancer type, biomarkers, prior treatments, performance status — and returns a ranked, explained list of matching clinical trials from a 64,920-trial ClinicalTrials.gov corpus. Keyword search fails for this problem because eligibility criteria are written in clinical shorthand: "EGFR exon 19 deletion, treatment-naive, ECOG ≤1" does not surface from a query like "lung cancer trial." The agentic approach solves this by decomposing the task — a parser agent structures the free text into a validated schema, a retrieval agent does semantic search and cross-encoder reranking over FAISS-indexed trial documents, and an explanation agent runs chain-of-thought eligibility reasoning per trial with SELF-RAG confidence flags and provenance citations. The result is a pipeline that produces ranked verdicts with reasoning, not a bag of keyword hits.
@@ -18,32 +32,14 @@ TrialCompass takes a free-text patient description — cancer type, biomarkers, 
 
 ## Architecture
 
-```
-Patient Profile (free text)
-        │
-        ▼
-┌─────────────────┐
-│   Parse Node    │  llama3 via Ollama — extracts cancer type, biomarkers,
-│                 │  ECOG, prior treatments, age, metastatic status
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Retrieve Node  │  neuml/pubmedbert-base-embeddings → FAISS top-50 → ms-marco cross-encoder rerank
-│                 │  64,920 oncology trials from ClinicalTrials.gov
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Explain Node   │  Chain-of-thought reasoning per trial
-│                 │  SELF-RAG confidence flags, provenance tagging
-└────────┬────────┘
-         │
-         ▼
-Ranked matches with verdicts, reasoning, and human-review flags
-```
+![TrialCompass Architecture](docs/architecture.png)
 
 The four nodes are wired as a linear LangGraph state machine. Errors propagate through a state field — no conditional edges, no silent swallowing. Each node is a thin wrapper around its agent module so the graph stays decoupled from inference logic.
+
+**Pipeline stages:**
+1. **Parser Agent** — LLaMA 3 via Ollama extracts structured fields (cancer type, biomarkers, ECOG, prior tx, age) from free text. Validated with Pydantic. Few-shot prompting drops latency from 25s to ~4s.
+2. **3-Stage Hybrid Retrieval** — SQL pre-filter narrows 64,920 trials to ~6,900, PubMedBERT FAISS retrieves top-500, MS-MARCO cross-encoder reranks to top-10.
+3. **Explanation Agent** — LLaMA 3 runs chain-of-thought eligibility reasoning per trial. Computed confidence scoring (8 penalty signals). Provenance citations. SELF-RAG uncertainty flags.
 
 ---
 
@@ -53,17 +49,26 @@ End-to-end pipeline validation: on a 68-year-old platinum-resistant BRCA1-mutant
 
 ---
 
-## Evaluation
+## Benchmark Results
 
-Embedding model: `neuml/pubmedbert-base-embeddings`. Corpus: 64,920 oncology trials from ClinicalTrials.gov. Eval set: 10-query oncology benchmark with 14 labeled NCT IDs, all manually verified against actual ClinicalTrials.gov eligibility criteria text before use as labels. Eval script: `src/evaluation/eval_three_configs.py`.
+10-query oncology benchmark · 14 manually verified patient-trial pairs · Eval script: `src/evaluation/eval_three_configs.py`
 
-| Configuration | P@5 | MRR | k | Notes |
-|---|---|---|---|---|
-| A: PubMedBERT bi-encoder only | 0.000 | 0.000 | 50 | Baseline |
-| B: + MS-MARCO cross-encoder rerank | 0.020 | 0.039 | 50 | CE signal degrades at k>100 on full corpus |
-| C: Hybrid (structured filter + CE rerank) | 0.040 | 0.084 | 500 | Filter reduces corpus to ~6,900; k=500 on filtered pool = k=50 density on full corpus |
+| Configuration | Description | P@5 | MRR |
+|---------------|-------------|-----|-----|
+| A — Bi-encoder only | PubMedBERT FAISS, k=50 | 0.000 | 0.000 |
+| B — Bi-encoder + CE rerank | + MS-MARCO cross-encoder | 0.020 | 0.039 |
+| C — Hybrid (ours) | + SQL structured pre-filter | **0.040** | **0.084** |
 
-The structured pre-filter is not a speed optimization — it is a quality gate. At k=500 on the full 64,920-trial corpus, cross-encoder scores compress toward a narrow band and performance degrades (Config B P@5 drops to 0.000). At k=500 on the filtered ~6,900-trial sub-corpus, pool density is equivalent to k=50 on the full corpus, and the cross-encoder maintains discriminative signal. This interaction between corpus size, retrieval depth, and reranker quality is the central empirical finding of this project.
+**Key finding:** The structured pre-filter is a quality gate, not a speed optimization. At k=500 on the filtered ~6,900-trial pool, pool density is equivalent to k=50 on the full corpus — and the cross-encoder maintains discriminative signal. At k=500 on the full 64,920-trial corpus (Config B), CE scores compress toward a narrow band and performance degrades. This interaction between corpus size, retrieval depth, and reranker quality is the central empirical finding of this project.
+
+### Model Ablation (LLM comparison)
+
+| Model | P@5 | MRR | Avg latency/trial | ELIGIBLE rate |
+|-------|-----|-----|-------------------|---------------|
+| LLaMA 3 (default) | 0.020 | 0.050 | 20.2s | 0.55 |
+| Mistral 7B | 0.020 | 0.050 | 85.5s | 0.76 |
+
+**Key finding:** LLaMA 3 selected as default — 4.2× faster with lower false-positive ELIGIBLE rate (0.55 vs 0.76). Mistral is more agreeable, not more accurate.
 
 ---
 
