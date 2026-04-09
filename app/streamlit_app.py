@@ -28,14 +28,18 @@ with st.sidebar:
 `llama3` via Ollama (local)
 
 **Retrieval encoder**
-`all-MiniLM-L6-v2`
+`neuml/pubmedbert-base-embeddings`
 
 **Re-ranker**
-`ms-marco-MiniLM-L-12-v2`
+`ms-marco-MiniLM-L-6-v2`
 
 **Corpus**
-10,000 oncology trials
+64,920 oncology trials
 (ClinicalTrials.gov)
+
+**Structured pre-filter**
+age, status, phase, condition keywords
+(narrows corpus before semantic search)
         """
     )
     st.divider()
@@ -197,7 +201,7 @@ if run_button:
 
             st.markdown(
                 f"Bi-encoder score: `{m.get('bi_encoder_score', 0):.4f}` &nbsp;|&nbsp; "
-                f"Cross-encoder score: `{m.get('cross_encoder_score', 0):.4f}`",
+                f"Cross-encoder score: `{m.get('ce_score', 0):.4f}`",
                 unsafe_allow_html=True,
             )
 
