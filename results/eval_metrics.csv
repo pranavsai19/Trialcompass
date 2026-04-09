@@ -1,0 +1,4 @@
+config,description,k,p_at_5,mrr,notes
+A,PubMedBERT bi-encoder only,50,0.000,0.000,Baseline — semantic retrieval alone insufficient for clinical trial matching
+B,PubMedBERT bi-encoder + MS-MARCO cross-encoder rerank,50,0.020,0.039,Cross-encoder adds signal but pool too diffuse at full corpus k=50
+C,Hybrid structured filter + PubMedBERT bi-encoder + MS-MARCO cross-encoder rerank,500,0.040,0.084,Structured pre-filter is a quality gate — doubles P@5 and MRR vs Config B
