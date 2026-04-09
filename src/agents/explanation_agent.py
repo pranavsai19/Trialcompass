@@ -149,7 +149,115 @@ def _should_flag_for_review(
             return True, f"uncertainty phrase in reasoning: '{phrase}'"
     if elig_len < _MIN_ELIGIBILITY_LENGTH:
         return True, f"eligibility text too short ({elig_len} chars) — likely truncated in DB"
+    # Flag on thin reasoning regardless of LLM confidence
+    if len(parsed.get("reasoning", "").strip()) < 100:
+        return True, "reasoning text too short — low quality output"
     return False, None
+
+
+# ---------------------------------------------------------------------------
+# Computed confidence and provenance helpers
+# ---------------------------------------------------------------------------
+
+def _extract_provenance(reasoning: str, trial: dict) -> list[str]:
+    """
+    Extract which specific eligibility criteria phrases from the trial
+    appear to be referenced in the model's reasoning.
+    Returns a list of up to 3 short matched phrases (max 80 chars each).
+    This is a lightweight keyword overlap — not semantic matching.
+    """
+    import re as _re
+    eligibility = trial.get("eligibility_text", "")
+    if not eligibility or not reasoning:
+        return []
+
+    clauses = _re.split(r'[;\n•\-]+', eligibility)
+    clauses = [c.strip() for c in clauses if len(c.strip()) > 20]
+
+    reasoning_lower = reasoning.lower()
+    matched = []
+    for clause in clauses:
+        words = clause.lower().split()
+        if len(words) < 3:
+            continue
+        for i in range(len(words) - 2):
+            trigram = " ".join(words[i:i+3])
+            if trigram in reasoning_lower:
+                matched.append(clause[:80])
+                break
+        if len(matched) >= 3:
+            break
+
+    return matched
+
+
+def _compute_confidence(
+    parsed: dict,
+    reasoning: str,
+    eligibility_text: str,
+    ce_score: float,
+    patient_profile_text: str,
+) -> str:
+    """
+    Compute a calibrated confidence score from observable signals.
+    Ignores the LLM's self-reported confidence field entirely.
+
+    Returns: "HIGH", "MEDIUM", or "LOW"
+
+    Scoring (starts at 100, deductions applied):
+    - Each uncertainty phrase found in reasoning: -15 points
+    - eligibility_text shorter than 200 chars: -30 points
+    - eligibility_text shorter than 500 chars: -15 points
+    - verdict is UNCERTAIN: -40 points
+    - verdict is ELIGIBLE but ce_score < 0.0: -20 points
+      (cross-encoder thinks it's a weak match but LLM says eligible — suspicious)
+    - verdict is INELIGIBLE but ce_score > 5.0: -10 points
+      (cross-encoder thinks it's a strong match but LLM says ineligible — worth reviewing)
+    - reasoning text shorter than 100 chars: -25 points
+      (model gave almost no reasoning — low quality output)
+
+    Thresholds:
+    - score >= 70: HIGH
+    - score >= 45: MEDIUM
+    - score < 45: LOW
+    """
+    score = 100
+    reasoning_lower = reasoning.lower()
+    verdict = parsed.get("verdict", "UNCERTAIN")
+
+    # Uncertainty phrase penalty
+    phrase_hits = sum(1 for p in _UNCERTAINTY_PHRASES if p in reasoning_lower)
+    score -= phrase_hits * 15
+
+    # Eligibility text quality penalty
+    if len(eligibility_text) < 200:
+        score -= 30
+    elif len(eligibility_text) < 500:
+        score -= 15
+
+    # Uncertain verdict penalty
+    if verdict == "UNCERTAIN":
+        score -= 40
+
+    # CE score vs verdict disagreement penalties
+    if verdict == "ELIGIBLE" and ce_score < 0.0:
+        score -= 20
+    if verdict == "INELIGIBLE" and ce_score > 5.0:
+        score -= 10
+
+    # Thin reasoning penalty
+    if len(reasoning.strip()) < 100:
+        score -= 25
+
+    # Clamp to 0-100
+    score = max(0, min(100, score))
+
+    if score >= 70:
+        return "HIGH"
+    elif score >= 45:
+        return "MEDIUM"
+    else:
+        return "LOW"
 
 
 # ---------------------------------------------------------------------------
@@ -203,8 +311,12 @@ No // comments. No $ref. No text outside the JSON object."""
 # Patient summary builder
 # ---------------------------------------------------------------------------
 
-def _build_patient_summary(profile: dict[str, Any]) -> str:
-    """Prose summary of the patient profile for the LLM prompt."""
+def _build_patient_summary(profile: "dict[str, Any] | str") -> str:
+    """Prose summary of the patient profile for the LLM prompt.
+    Accepts either a structured dict (normal pipeline path) or a plain
+    string (direct testing / smoke tests)."""
+    if isinstance(profile, str):
+        return profile
     parts: list[str] = []
 
     cancer = profile.get("cancer_type")
@@ -343,18 +455,25 @@ def explain_matches(
             else:
                 print(f"           provenance: call failed or timed out")
 
+        _reasoning = parsed.get("reasoning", "")
+        _elig      = trial.get("eligibility_text", "")
+        _ce_score  = trial.get("ce_score", 0.0)
+
         results.append({
             **trial,
             "rank": i + 1,
             "verdict": parsed.get("verdict", "UNCERTAIN"),
-            "confidence": parsed.get("confidence", "LOW"),
+            "confidence": _compute_confidence(
+                parsed, _reasoning, _elig, _ce_score, patient_summary,
+            ),
+            "llm_raw_confidence": parsed.get("confidence", "UNKNOWN"),
             "inclusion_met": inclusion_met,
             "inclusion_failed": parsed.get("inclusion_failed") or [],
             "exclusion_flags": parsed.get("exclusion_flags") or [],
-            "reasoning": parsed.get("reasoning", ""),
+            "reasoning": _reasoning,
             "human_review_flag": flag,
             "flag_reason": flag_reason,
-            "provenance": provenance,
+            "provenance": _extract_provenance(_reasoning, trial),
         })
 
     return results
