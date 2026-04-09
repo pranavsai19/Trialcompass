@@ -10,7 +10,7 @@
 
 ## Overview
 
-TrialCompass takes a free-text patient description — cancer type, biomarkers, prior treatments, performance status — and returns a ranked, explained list of matching clinical trials from a 10,000-trial ClinicalTrials.gov corpus. Keyword search fails for this problem because eligibility criteria are written in clinical shorthand: "EGFR exon 19 deletion, treatment-naive, ECOG ≤1" does not surface from a query like "lung cancer trial." The agentic approach solves this by decomposing the task — a parser agent structures the free text into a validated schema, a retrieval agent does semantic search and cross-encoder reranking over FAISS-indexed trial documents, and an explanation agent runs chain-of-thought eligibility reasoning per trial with SELF-RAG confidence flags and provenance citations. The result is a pipeline that produces ranked verdicts with reasoning, not a bag of keyword hits.
+TrialCompass takes a free-text patient description — cancer type, biomarkers, prior treatments, performance status — and returns a ranked, explained list of matching clinical trials from a 64,920-trial ClinicalTrials.gov corpus. Keyword search fails for this problem because eligibility criteria are written in clinical shorthand: "EGFR exon 19 deletion, treatment-naive, ECOG ≤1" does not surface from a query like "lung cancer trial." The agentic approach solves this by decomposing the task — a parser agent structures the free text into a validated schema, a retrieval agent does semantic search and cross-encoder reranking over FAISS-indexed trial documents, and an explanation agent runs chain-of-thought eligibility reasoning per trial with SELF-RAG confidence flags and provenance citations. The result is a pipeline that produces ranked verdicts with reasoning, not a bag of keyword hits.
 
 ---
 
@@ -27,8 +27,8 @@ Patient Profile (free text)
          │
          ▼
 ┌─────────────────┐
-│  Retrieve Node  │  all-MiniLM-L6-v2 → FAISS top-50 → ms-marco cross-encoder rerank
-│                 │  10,000 oncology trials from ClinicalTrials.gov
+│  Retrieve Node  │  neuml/pubmedbert-base-embeddings → FAISS top-50 → ms-marco cross-encoder rerank
+│                 │  64,920 oncology trials from ClinicalTrials.gov
 └────────┬────────┘
          │
          ▼
@@ -86,7 +86,7 @@ PYTHONPATH=. python src/orchestration/run_pipeline.py \
 PYTHONPATH=. streamlit run app/streamlit_app.py
 ```
 
-Ollama must be running (`ollama serve`) before any inference call. The FAISS index and SQLite database are in `data/` — no rebuild step needed for the 10K-trial corpus.
+Ollama must be running (`ollama serve`) before any inference call. The FAISS index and SQLite database are in `data/` — no rebuild step needed for the 64K-trial corpus.
 
 ---
 
@@ -97,7 +97,7 @@ trialcompass/
 ├── app/
 │   └── streamlit_app.py          # Streamlit UI — full pipeline demo
 ├── data/
-│   ├── faiss_index.bin           # FAISS flat IP index, 10K trials
+│   ├── trials_pubmedbert.index   # FAISS flat IP index, 64K trials (PubMedBERT)
 │   ├── nct_ids.npy               # NCT ID array aligned to FAISS index
 │   └── trialcompass.db           # SQLite — trials table with chunk_text, eligibility_text
 ├── notebooks/
@@ -112,7 +112,7 @@ trialcompass/
 │   │   ├── retrieval_agent.py    # FAISS bi-encoder + cross-encoder reranker
 │   │   └── explanation_agent.py  # CoT eligibility reasoning, SELF-RAG flags, provenance
 │   ├── embeddings/
-│   │   ├── embed.py              # Batch embedding with all-MiniLM-L6-v2
+│   │   ├── embed.py              # Batch embedding with neuml/pubmedbert-base-embeddings
 │   │   └── faiss_index.py        # Index build and persistence
 │   ├── ingestion/
 │   │   ├── fetch_trials.py       # ClinicalTrials.gov API v2 pull
@@ -130,7 +130,7 @@ trialcompass/
 ## Known Limitations
 
 - **Eligibility text truncation at 2,000 characters.** The LLM only sees the first ~500 tokens of each trial's eligibility criteria. Disqualifying criteria buried in the second half of the document are invisible to the explanation agent. This is the primary driver of the 40% hallucination rate.
-- **ms-marco cross-encoder domain mismatch.** The cross-encoder was trained on web retrieval pairs, not clinical text. It degrades P@5 from 0.080 to 0.060 on this eval set. A biomedical cross-encoder fine-tuned on clinical trial text is the planned replacement.
+- **ms-marco-MiniLM-L-6-v2 cross-encoder domain mismatch.** The cross-encoder was trained on web retrieval pairs, not clinical text. It scores BRCA1 co-occurrence highly across cancer types without understanding that pancreatic ≠ ovarian — the LLM explanation layer catches these false positives as a downstream safety gate. A biomedical cross-encoder fine-tuned on clinical trial text is the planned replacement.
 - **llama3 confidence is not calibrated.** The model reports HIGH confidence on approximately every verdict, including wrong ones. The SELF-RAG human-review flag is driven by uncertainty phrases in the reasoning text and eligibility text length — the confidence field itself should be ignored.
 
 ---
