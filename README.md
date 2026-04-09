@@ -1,5 +1,7 @@
 # TrialCompass
 
+![Tests](https://github.com/pranavsai19/Trialcompass/actions/workflows/tests.yml/badge.svg)
+
 **Agentic clinical trial matching for oncology patients**
 
 ![Python 3.11](https://img.shields.io/badge/python-3.11-blue)
