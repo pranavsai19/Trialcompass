@@ -27,8 +27,9 @@ from typing import Any, Optional
 
 import requests
 
-OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-MODEL = "llama3"
+from src.config import MODEL_NAME, OLLAMA_URL
+
+MODEL = MODEL_NAME
 
 # Phrases in the model's reasoning that indicate it is working from incomplete information.
 # The model won't say "I cannot determine" in its confidence field — it will say HIGH —

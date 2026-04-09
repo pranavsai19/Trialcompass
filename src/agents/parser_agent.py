@@ -24,8 +24,10 @@ from typing import Literal, Optional
 import requests
 from pydantic import BaseModel, ValidationError, field_validator
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_MODEL = "llama3"
+from src.config import MODEL_NAME, OLLAMA_URL as _OLLAMA_URL
+
+OLLAMA_URL = _OLLAMA_URL
+DEFAULT_MODEL = MODEL_NAME
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
